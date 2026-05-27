@@ -19,7 +19,7 @@ last_withdrawal_notification = {}
 global FLYER_API_KEY, flyer, flyer_enabled
 
 BOT_TOKEN = "8450626723:AAHkbONr-iGmAQgtcAMIBxZXkkI0_QM82AM"
-FLYER_API_KEY = "FL-GeBnNH-utNjHN-IbxtAT-eLiEzk"
+FLYER_API_KEY = "FL-guuNET-NceLIO-Rwolme-AICSyn"
 ADMIN_IDS = [7975675184, 1723065839]
 FLZAD = 0.011
 # 🔹 Глобальные переменные криптобота
