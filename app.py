@@ -908,45 +908,6 @@ async def init_db():
         ''')
         # якщо нема запису — додаємо дефолтне значення
         await db.execute('INSERT OR IGNORE INTO settings (key, value) VALUES ("user_task_reward", "0.015")')
-        await db.execute('INSERT OR IGNORE INTO settings (key, value) VALUES ("user_task_reward_2", "0.004")')
-        await db.execute('INSERT OR IGNORE INTO settings (key, value) VALUES ("linkni_sell_code", "e4s")')
-        await db.execute('INSERT OR IGNORE INTO settings (key, value) VALUES ("linkni_sub_code", "saturn")')
-
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS linkni_subscriptions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                sell_code TEXT NOT NULL,
-                sub_code TEXT,
-                event_ts TEXT,
-                received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                raw_json TEXT
-            )
-        ''')
-        try:
-            await db.execute("ALTER TABLE linkni_subscriptions ADD COLUMN event_ts TEXT")
-        except Exception:
-            pass
-        try:
-            await db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_linkni_event_unique "
-                "ON linkni_subscriptions(user_id, sell_code, COALESCE(sub_code, ''), COALESCE(event_ts, ''))"
-            )
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN linkni_session_started_at TIMESTAMP")
-        except Exception:
-            pass
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS linkni_paid_events (
-                subscription_id INTEGER PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                amount REAL NOT NULL,
-                paid_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
 
         # 🔹 Добавляем поле ad_balance, если его нет
         try:
@@ -978,11 +939,7 @@ async def init_db():
                 print(f"⚠️ penalty_amount already exists or error: {e}")
 
         try:
-            await db.execute("ALTER TABLE users ADD COLUMN linkni_session_started_at TIMESTAMP")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE linkni_subscriptions ADD COLUMN event_ts TEXT")
+            await db.execute("ALTER TABLE frozen_transactions ADD COLUMN task_ref TEXT")
         except Exception:
             pass
 
@@ -1641,13 +1598,12 @@ async def check_user_blocked(user_id):
 def get_main_keyboard(user_id: int):
     keyboard = ReplyKeyboardBuilder()
     keyboard.button(text="Задания", style='primary', icon_custom_emoji_id='5253742260054409879')  # 👈 нова кнопка
-    keyboard.button(text="Задания №2", icon_custom_emoji_id='5253742260054409879')
     keyboard.button(text="Рефералы", icon_custom_emoji_id='5271604874419647061')
     keyboard.button(text="Кабинет", icon_custom_emoji_id='5416041192905265756')  # 👈 нова кнопка
     keyboard.button(text="Статистика", icon_custom_emoji_id='5244837092042750681')
     if user_id in ADMIN_IDS:
         keyboard.button(text="👨‍💻 Админка")
-    keyboard.adjust(2, 2, 2, 1)
+    keyboard.adjust(2, 2, 1)
     return keyboard.as_markup(resize_keyboard=True)
 
 
@@ -2092,259 +2048,6 @@ async def is_user_subscribed(bot, user_id: int, channel_username: str) -> bool:
         return False
 
 
-# =========================
-# Linkni — задания №2
-# Документация: startapp=x_{sell_code}_{sub_code}, webhook + API subscriptions
-# =========================
-LINKNI_APP_URL = "https://t.me/linknibot/app"
-LINKNI_API_URL = "https://go.linkni.me/api/subscriptions"
-
-
-async def get_linkni_config():
-    sell_code = (await get_setting("linkni_sell_code") or "e4s").strip()
-    sub_code = (await get_setting("linkni_sub_code") or "saturn").strip()
-    reward = float(await get_setting("user_task_reward_2") or 0.004)
-    return sell_code, sub_code, reward
-
-
-def build_linkni_startapp(sell_code: str, sub_code: str) -> str:
-    """t.me/linknibot/app?startapp=x_2tz9_MYCODE"""
-    sell_code = (sell_code or "").strip()
-    sub_code = (sub_code or "").strip()
-    if sub_code:
-        return f"x_{sell_code}_{sub_code}"
-    return f"x_{sell_code}"
-
-
-def build_linkni_app_link(sell_code: str, sub_code: str) -> str:
-    return f"{LINKNI_APP_URL}?startapp={build_linkni_startapp(sell_code, sub_code)}"
-
-
-async def linkni_ensure_tables(db):
-    await db.execute('''
-        CREATE TABLE IF NOT EXISTS linkni_subscriptions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            sell_code TEXT NOT NULL,
-            sub_code TEXT,
-            event_ts TEXT,
-            received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            raw_json TEXT
-        )
-    ''')
-    try:
-        await db.execute("ALTER TABLE linkni_subscriptions ADD COLUMN event_ts TEXT")
-    except Exception:
-        pass
-    try:
-        await db.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_linkni_event_unique "
-            "ON linkni_subscriptions(user_id, sell_code, COALESCE(sub_code, ''), COALESCE(event_ts, ''))"
-        )
-    except Exception:
-        pass
-    await db.execute('''
-        CREATE TABLE IF NOT EXISTS linkni_paid_events (
-            subscription_id INTEGER PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            paid_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-
-def linkni_normalize_event_ts(item: dict) -> str:
-    """Уникальный ключ события из API/webhook (поле timestamp)."""
-    ts = item.get("timestamp") or item.get("time") or item.get("created_at")
-    if ts:
-        return str(ts).strip()
-    return ""
-
-
-async def linkni_start_session(user_id: int):
-    """Новая сессия «Задания №2» — платим только за подписки после этого момента."""
-    async with aiosqlite.connect("bot_database.db") as db:
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN linkni_session_started_at TIMESTAMP")
-        except Exception:
-            pass
-        await db.execute(
-            "UPDATE users SET linkni_session_started_at = datetime('now') WHERE user_id = ?",
-            (user_id,),
-        )
-        await db.commit()
-
-
-async def linkni_get_session_started(user_id: int):
-    async with aiosqlite.connect("bot_database.db") as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT linkni_session_started_at FROM users WHERE user_id = ?",
-            (user_id,),
-        ) as cur:
-            row = await cur.fetchone()
-    if not row:
-        return None
-    return row["linkni_session_started_at"] if "linkni_session_started_at" in row.keys() else None
-
-
-async def linkni_save_subscription(
-    user_id: int,
-    status: str,
-    sell_code: str,
-    sub_code=None,
-    raw_json=None,
-    event_ts: str = "",
-):
-    """Сохранить событие без дублей (уникальный event_ts или короткое окно для webhook)."""
-    sub_code = sub_code or ""
-    event_ts = (event_ts or "").strip()
-
-    async with aiosqlite.connect("bot_database.db") as db:
-        await linkni_ensure_tables(db)
-
-        if not event_ts and status == "subscribed":
-            # Webhook без timestamp: не дублируем то же событие за 3 минуты
-            async with db.execute(
-                '''
-                SELECT 1 FROM linkni_subscriptions
-                WHERE user_id = ? AND status = ? AND sell_code = ?
-                  AND COALESCE(sub_code, '') = ?
-                  AND received_at > datetime('now', '-3 minutes')
-                LIMIT 1
-                ''',
-                (user_id, status, sell_code, sub_code),
-            ) as cur:
-                if await cur.fetchone():
-                    return False
-
-        try:
-            await db.execute(
-                '''
-                INSERT INTO linkni_subscriptions
-                (user_id, status, sell_code, sub_code, event_ts, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ''',
-                (user_id, status, sell_code, sub_code or None, event_ts or None, raw_json),
-            )
-            await db.commit()
-            return True
-        except Exception as e:
-            if "UNIQUE" in str(e).upper() or "unique" in str(e):
-                return False
-            raise
-
-
-async def linkni_sync_from_api(user_id: int, sell_code: str, sub_code: str):
-    """Подтянуть подписки из API только за текущую сессию (не дублировать старый час)."""
-    session_at = await linkni_get_session_started(user_id)
-    if not session_at:
-        return
-
-    params = {"code": sell_code, "user_id": user_id}
-    if sub_code:
-        params["sub_code"] = sub_code
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(LINKNI_API_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    print(f"[Linkni API] HTTP {resp.status} для user {user_id}")
-                    return
-                data = await resp.json()
-    except Exception as e:
-        print(f"[Linkni API] ошибка: {e}")
-        return
-
-    if not isinstance(data, list):
-        return
-
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        if item.get("status") != "subscribed":
-            continue
-        try:
-            uid = int(item.get("user_id"))
-        except (TypeError, ValueError):
-            continue
-        if uid != user_id:
-            continue
-
-        event_ts = linkni_normalize_event_ts(item)
-        # Не подтягиваем подписки, которые были ДО открытия «Задания №2»
-        if event_ts and str(event_ts) < str(session_at)[:19]:
-            continue
-
-        item_sub = item.get("sub_code") or sub_code
-        await linkni_save_subscription(
-            uid,
-            "subscribed",
-            sell_code,
-            item_sub,
-            json.dumps(item, ensure_ascii=False),
-            event_ts=event_ts,
-        )
-
-
-async def get_unpaid_linkni_subscriptions(user_id: int, sell_code: str, sub_code: str, since_session: bool = True):
-    """
-    Неоплаченные подписки.
-    since_session=True — только с момента открытия «Задания №2» (не копим старые выплаты).
-    """
-    session_at = await linkni_get_session_started(user_id) if since_session else None
-
-    async with aiosqlite.connect("bot_database.db") as db:
-        await linkni_ensure_tables(db)
-        db.row_factory = aiosqlite.Row
-
-        query = '''
-            SELECT s.id, s.status, s.sell_code, s.sub_code, s.received_at
-            FROM linkni_subscriptions s
-            LEFT JOIN linkni_paid_events p ON p.subscription_id = s.id
-            WHERE s.user_id = ?
-              AND s.status = 'subscribed'
-              AND s.sell_code = ?
-              AND (s.sub_code = ? OR (? = '' AND (s.sub_code IS NULL OR s.sub_code = '')))
-              AND p.subscription_id IS NULL
-        '''
-        params = [user_id, sell_code, sub_code, sub_code]
-
-        if session_at:
-            query += " AND s.received_at >= ?"
-            params.append(session_at)
-
-        query += " ORDER BY s.received_at ASC"
-
-        return await db.execute_fetchall(query, tuple(params))
-
-
-async def pay_linkni_subscriptions(user_id: int, reward: float, sell_code: str, sub_code: str):
-    """Выплата только за новые подписки в текущей сессии Linkni."""
-    await linkni_sync_from_api(user_id, sell_code, sub_code)
-    rows = await get_unpaid_linkni_subscriptions(user_id, sell_code, sub_code, since_session=True)
-
-    paid = 0
-    total = 0.0
-    for row in rows:
-        sub_id = row["id"]
-        async with aiosqlite.connect("bot_database.db") as db:
-            cur = await db.execute(
-                'INSERT OR IGNORE INTO linkni_paid_events (subscription_id, user_id, amount) VALUES (?, ?, ?)',
-                (sub_id, user_id, reward),
-            )
-            if cur.rowcount == 0:
-                continue
-            await db.commit()
-
-        await update_user_balance(user_id, frozen_amount=reward, completed_tasks=1)
-        await add_frozen_transaction(user_id, reward, 'linkni', sub_id)
-        paid += 1
-        total += reward
-
-    return paid, total
-
-
 def normalize_tg_link(value: str) -> str:
     if not value:
         return ""
@@ -2439,50 +2142,6 @@ async def show_user_tasks(message: types.Message):
     await message.answer(text, reply_markup=main_keyboard.as_markup(), parse_mode="HTML")
 
 
-async def show_user_tasks_v2(message: types.Message):
-    """
-    Задания №2 — Linkni: подписки через mini-app, проверка webhook + API.
-    """
-    user_id = message.from_user.id
-    await linkni_start_session(user_id)
-
-    sell_code, sub_code, reward = await get_linkni_config()
-    app_link = build_linkni_app_link(sell_code, sub_code)
-
-    unpaid = await get_unpaid_linkni_subscriptions(user_id, sell_code, sub_code, since_session=True)
-    pending_pay = len(unpaid)
-
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="📲 Открыть задания Linkni", url=app_link))
-    kb.row(
-        InlineKeyboardButton(
-            text="✅ Проверить подписку",
-            callback_data="check_user_tasks_v2",
-            style='success',
-            icon_custom_emoji_id='5206607081334906820',
-        )
-    )
-
-    text = (
-        f"📝 <b>Задания №2 (Linkni)</b>\n"
-        f"───────────────\n"
-        f"<tg-emoji emoji-id='5224257782013769471'>💫</tg-emoji> "
-        f"<b>Награда:</b> {reward:.3f}$ за каждую подписку\n"
-    )
-    if pending_pay > 0:
-        text += (
-            f"\n🎁 <b>Готово к выплате за эту сессию:</b> {pending_pay} "
-            f"(≈ {pending_pay * reward:.3f}$)"
-        )
-    else:
-        text += (
-            "\n<i>Сначала откройте Linkni и выполните подписки, "
-            "затем нажмите «Проверить».</i>"
-        )
-
-    await message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML", disable_web_page_preview=True)
-
-
 @dp.callback_query(F.data == "check_user_tasks")
 async def check_user_tasks(call: types.CallbackQuery):
     user_id = call.from_user.id
@@ -2564,39 +2223,6 @@ async def check_user_tasks(call: types.CallbackQuery):
         await call.message.edit_text(result_text, parse_mode='HTML')
     else:
         await call.answer("❌ Вы ещё не выполнили ни одного задания.", show_alert=True)
-
-
-@dp.callback_query(F.data == "check_user_tasks_v2")
-async def check_user_tasks_v2(call: types.CallbackQuery):
-    user_id = call.from_user.id
-    sell_code, sub_code, reward = await get_linkni_config()
-
-    if not await linkni_get_session_started(user_id):
-        await linkni_start_session(user_id)
-
-    await call.answer("🔍 Проверяем подписки Linkni...")
-
-    paid_count, total_reward = await pay_linkni_subscriptions(user_id, reward, sell_code, sub_code)
-
-    if paid_count > 0:
-        asyncio.create_task(show_ad_at_opportunity(user_id, "after_task"))
-        result_text = (
-            f"✅ <b>Проверка Linkni завершена!</b>\n\n"
-            f"📊 Зачтено подписок: <b>{paid_count}</b>\n"
-            f"💰 Начислено: <b>{total_reward:.3f}$</b>\n\n"
-            f"💸 Средства заморожены на 24 часа"
-        )
-        try:
-            await call.message.edit_text(result_text, parse_mode='HTML')
-        except Exception:
-            await call.message.answer(result_text, parse_mode='HTML')
-    else:
-        await call.answer(
-            "❌ Новых подписок за эту сессию нет.\n\n"
-            "Откройте «Задания №2» заново, выполните подписки в Linkni "
-            "и подождите 5–10 сек.",
-            show_alert=True,
-        )
 
 
 # Админ клавиатура
@@ -3066,15 +2692,6 @@ async def show_tasks(message: types.Message):
             display_name = task_name
 
     await message.answer(text, reply_markup=main_keyboard.as_markup(), parse_mode='HTML')
-
-
-@dp.message(F.text.lower() == "задания №2")
-async def show_tasks_v2(message: types.Message):
-    user_id = message.from_user.id
-    if await check_user_blocked(user_id):
-        await message.answer("❌ Ваш аккаунт заблокирован. Обратитесь к администратору.")
-        return
-    await show_user_tasks_v2(message)
 
 
 # Обработчик проверки нескольких заданий
@@ -4541,7 +4158,6 @@ async def admin_settings(message: types.Message):
 
     promo_price = float(await get_setting("promotion_price") or 0.015)
     current_value = await get_setting("user_task_reward") or "0.015"
-    current_value_v2 = await get_setting("user_task_reward_2") or "0.004"
 
     keyboard = InlineKeyboardBuilder()
     keyboard.button(text="🔑 Настройки Flyer", callback_data="flyer_settings")
@@ -4555,7 +4171,6 @@ async def admin_settings(message: types.Message):
     keyboard.button(text="💸 Настройки рефералов", callback_data="change_referral_settings")
     keyboard.button(text=f"✏️ Цена зад. {promo_price:.3f}", callback_data="edit_promotion_price")
     keyboard.button(text=f"✏️ Выпл.польз.зад. {current_value}", callback_data="edit_user_task_reward")
-    keyboard.button(text=f"✏️ Выпл.польз.зад.№2 {current_value_v2}", callback_data="edit_user_task_reward_v2")
     keyboard.button(text="📡 Канал выплат", callback_data="set_payment_channel")
     keyboard.button(text="🛡 Требования вывода", callback_data="withdraw_requirements")
     keyboard.button(text="🌿 OP Tgrass", callback_data="admin_tgrass_settings")
@@ -4963,40 +4578,6 @@ async def process_new_user_task_reward(message: Message, state: FSMContext):
         await state.clear()
     except ValueError:
         await message.answer("❌ Введите корректное число (например: 0.02).")
-        await state.clear()
-
-
-class EditUserTaskRewardV2(StatesGroup):
-    waiting_for_new_value = State()
-
-
-@dp.callback_query(F.data == "edit_user_task_reward_v2")
-async def edit_user_task_reward_v2(call: CallbackQuery, state: FSMContext):
-    await call.message.answer(
-        f"💸 <b>Текущая выплата за задание №2:</b>\n\n"
-        f"Введите новое значение:",
-        parse_mode="HTML"
-    )
-    await state.set_state(EditUserTaskRewardV2.waiting_for_new_value)
-    await call.answer()
-
-
-@dp.message(EditUserTaskRewardV2.waiting_for_new_value)
-async def process_new_user_task_reward_v2(message: Message, state: FSMContext):
-    try:
-        new_value = float(message.text.strip())
-        if new_value <= 0:
-            await message.answer("❌ Сумма должна быть больше 0.")
-            return
-
-        await set_setting("user_task_reward_2", str(new_value))
-        await message.answer(
-            f"✅ Выплата за задания №2 успешно изменена на <b>{new_value}$</b>.",
-            parse_mode="HTML"
-        )
-        await state.clear()
-    except ValueError:
-        await message.answer("❌ Введите корректное число (например: 0.004).")
         await state.clear()
 
 
@@ -6009,83 +5590,42 @@ async def check_completed_tasks():
             # Получаем пользователей с замороженными средствами и их транзакции
             async with aiosqlite.connect('bot_database.db') as db:
                 async with db.execute('''
-                    SELECT ft.id, ft.user_id, ft.amount, ft.task_type, ft.task_id, 
-                           u.username, ft.frozen_at, ft.unfreeze_at, ft.is_unfrozen, ft.penalty_applied
+                    SELECT ft.id, ft.user_id, ft.amount, ft.task_type, ft.task_ref,
+                           ft.frozen_at, ft.unfreeze_at, ft.is_unfrozen, ft.penalty_applied,
+                           u.username
                     FROM frozen_transactions ft
                     JOIN users u ON ft.user_id = u.user_id
-                    WHERE ft.is_unfrozen = FALSE 
+                    WHERE ft.is_unfrozen = FALSE
                     AND ft.task_type = 'flyer'
-                    AND ft.penalty_applied = 0  # Только неоштрафованные
+                    AND COALESCE(ft.penalty_applied, 0) = 0
+                    AND ft.task_ref IS NOT NULL AND ft.task_ref != ''
                 ''') as cursor:
                     transactions_to_check = await cursor.fetchall()
 
-            print(f"🔍 Найдено транзакций для проверки: {len(transactions_to_check)}")
+            print(f"🔍 Найдено Flyer-транзакций для проверки: {len(transactions_to_check)}")
 
             total_penalties = 0
+            strict_unsubscribe_statuses = ["unsubscribed", "abort", "failed", "unsubscribe"]
 
             for tx_row in transactions_to_check:
-                tx_id = tx_row[0]
-                user_id = tx_row[1]
-                amount = tx_row[2]
-                task_type = tx_row[3]
-                task_ref = tx_row[4]
-                username = tx_row[5]
+                tx_id, user_id, amount, task_type, signature = tx_row[0], tx_row[1], tx_row[2], tx_row[3], tx_row[4]
+                username = tx_row[9]
 
-                print(f"\n👤 Проверяем: {username} (ID: {user_id}) - Транзакция: {tx_id}")
+                print(f"\n👤 {username} (ID: {user_id}) tx={tx_id} signature={signature}")
 
-                # Получаем ВЫПОЛНЕННЫЕ задания для этого пользователя
-                async with aiosqlite.connect('bot_database.db') as db:
-                    async with db.execute('''
-                        SELECT signature FROM completed_tasks 
-                        WHERE user_id = ? AND status = "completed"
-                    ''', (user_id,)) as cursor:
-                        completed_signatures = await cursor.fetchall()
+                status = await flyer_check_task(signature, user_id)
+                print(f"   📊 Статус Flyer API: {status}")
 
-                print(f"   📝 Выполненных заданий: {len(completed_signatures)}")
+                if status not in strict_unsubscribe_statuses:
+                    print(f"   ✅ Подписка активна")
+                    continue
 
-                penalty_applied = False
-
-                for signature_row in completed_signatures:
-                    signature = signature_row[0]
-
-                    print(f"   🔍 Проверяем задание: {signature}")
-
-                    # ПЕРВАЯ ПРОВЕРКА - ТОЛЬКО ЯВНЫЕ ПРИЗНАКИ ОТПИСКИ
-                    first_status = await flyer_check_task(signature, user_id)
-                    print(f"   📊 Первая проверка Flyer: {first_status}")
-
-                    # СУЖЕННЫЙ СПИСОК - только явные признаки отписки
-                    strict_unsubscribe_statuses = ["unsubscribed", "abort", "failed"]
-
-                    if first_status in strict_unsubscribe_statuses:
-                        print(f"   🚨 ВОЗМОЖНАЯ ОТПИСКА! Статус: {first_status}")
-
-                        # Ждем 10 минут для подтверждения
-                        print(f"   ⏳ Ждем 10 минут для подтверждения...")
-                        await asyncio.sleep(600)  # 10 минут
-
-                        # ВТОРАЯ ПРОВЕРКА - ТОЧНАЯ
-                        final_status = await flyer_check_task(signature, user_id)
-                        print(f"   🔍 Вторая проверка: {final_status}")
-
-                        # Штрафуем ТОЛЬКО если обе проверки показали отписку
-                        if final_status in strict_unsubscribe_statuses:
-                            print(f"   ✅ ПОДТВЕРЖДЕНА ОТПИСКА! Применяем штраф")
-
-                            # Используем вашу существующую функцию штрафа
-                            await apply_penalty_for_transaction(tx_row)
-                            penalty_applied = True
-                            total_penalties += 1
-                            break  # Прерываем проверку для этого пользователя
-                        else:
-                            print(f"   ✅ Отписка не подтвердилась. Статус: {final_status}")
-                    else:
-                        print(f"   ✅ Задание в норме. Статус: {first_status}")
-
-                if not penalty_applied:
-                    print(f"   ✅ Пользователь {username} не нарушал правила")
-
-                await asyncio.sleep(2)  # Небольшая пауза между пользователями
+                print(f"   🚨 Отписка: {status} — штраф")
+                penalty_row = (tx_id, user_id, amount, task_type, signature)
+                await apply_penalty_for_transaction(penalty_row)
+                await set_task_status(user_id, signature, status)
+                total_penalties += 1
+                await asyncio.sleep(1)
 
             print(f"📊 Проверка завершена. Штрафов: {total_penalties}")
             print("⏰ Следующая проверка через 1 час")
@@ -7090,16 +6630,34 @@ async def process_edit_value(message: types.Message, state: FSMContext):
     await state.clear()
 
 
-async def add_frozen_transaction(user_id, amount, task_type, task_id=None):
-    """Добавляет запись о замороженных средствах"""
+async def add_frozen_transaction(user_id, amount, task_type, task_id=None, task_ref=None):
+    """Добавляет запись о замороженных средствах. task_ref — signature Flyer (строка)."""
+    numeric_task_id = None
+    ref = task_ref
+    if ref is None and isinstance(task_id, str):
+        ref = task_id
+    elif isinstance(task_id, int):
+        numeric_task_id = task_id
+    elif task_id is not None and not isinstance(task_id, str):
+        try:
+            numeric_task_id = int(task_id)
+        except (TypeError, ValueError):
+            ref = str(task_id)
+
     try:
         async with aiosqlite.connect('bot_database.db') as db:
+            try:
+                await db.execute("ALTER TABLE frozen_transactions ADD COLUMN task_ref TEXT")
+            except Exception:
+                pass
             await db.execute(
-                'INSERT INTO frozen_transactions (user_id, amount, task_type, task_id, unfreeze_at) VALUES (?, ?, ?, ?, datetime("now", "+24 hours"))',
-                (user_id, amount, task_type, task_id)
+                '''INSERT INTO frozen_transactions 
+                   (user_id, amount, task_type, task_id, task_ref, unfreeze_at) 
+                   VALUES (?, ?, ?, ?, ?, datetime("now", "+24 hours"))''',
+                (user_id, amount, task_type, numeric_task_id, ref)
             )
             await db.commit()
-            print(f"✅ Записана замороженная транзакция: {user_id} - {amount}$ - {task_type}")
+            print(f"✅ Записана замороженная транзакция: {user_id} - {amount}$ - {task_type} ref={ref}")
     except Exception as e:
         print(f"❌ Ошибка записи замороженной транзакции: {e}")
 
@@ -7579,7 +7137,7 @@ async def check_unsubscribed_penalties():
                     SELECT utc.task_id, utc.user_id, utc.completed_at, ut.channel_username, ut.task_type
                     FROM user_task_completions utc
                     JOIN user_tasks ut ON utc.task_id = ut.id
-                    WHERE ut.task_type = 'channel'  # ← ТІЛЬКИ КАНАЛИ!
+                    WHERE ut.task_type = 'channel'
                 """)
 
             now = datetime.utcnow()
