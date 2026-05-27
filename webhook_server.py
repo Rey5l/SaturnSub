@@ -19,6 +19,11 @@ logger = logging.getLogger("webhook_server")
 
 # Папка, где лежит этот файл (важно, если запускаете из другой директории)
 BASE_DIR = Path(__file__).resolve().parent
+LINKNI_WEBHOOK_SECRET = "reyslAndAmir1331"
+DB_PATH = str(BASE_DIR / "bot_database.db")
+
+# Боевые статусы от Linkni (status "test" обрабатывается отдельно)
+LINKNI_STATUSES = ("subscribed", "not_subscribed", "no_sponsors")
 
 app = FastAPI()
 
@@ -59,10 +64,17 @@ async def webhook_handler(request: Request):
 # =========================
 # Linkni webhook
 # =========================
-LINKNI_WEBHOOK_SECRET = "reyslAndAmir1331"
 
-# SQLite рядом с этим скриптом. Если бот в другой папке — укажите полный путь вручную.
-DB_PATH = str(BASE_DIR / "bot_database.db")
+
+@app.get("/webhook/linkni/{secret}")
+async def linkni_webhook_get(secret: str):
+    if secret != LINKNI_WEBHOOK_SECRET:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {
+        "ok": True,
+        "message": "Webhook работает. Linkni отправляет POST с JSON.",
+        "method_required": "POST",
+    }
 
 
 @app.post("/webhook/linkni/{secret}")
@@ -82,15 +94,25 @@ async def linkni_webhook(secret: str, request: Request):
 
     logger.info("[Linkni] JSON: %s", data)
 
-    user_id = data.get("user_id")
     status = data.get("status")
     sell_code = data.get("sell_code")
     sub_code = data.get("sub_code")
 
-    if not isinstance(user_id, int):
-        logger.warning("[Linkni] user_id не int: %r", user_id)
+    # Тест из панели Linkni: {"user_id": 0, "status": "test", "sell_code": "..."}
+    if status == "test":
+        logger.info("[Linkni] тестовый запрос — OK")
+        return {"ok": True, "test": True}
+
+    try:
+        user_id = int(data.get("user_id"))
+    except (TypeError, ValueError):
+        logger.warning("[Linkni] user_id не число: %r", data.get("user_id"))
         raise HTTPException(status_code=400, detail="user_id must be int")
-    if status not in ("subscribed", "not_subscribed", "no_sponsors"):
+
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="user_id must be positive")
+
+    if status not in LINKNI_STATUSES:
         logger.warning("[Linkni] неверный status: %r", status)
         raise HTTPException(status_code=400, detail="invalid status")
     if not sell_code or not isinstance(sell_code, str):
