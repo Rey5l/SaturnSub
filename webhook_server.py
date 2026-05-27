@@ -1,6 +1,7 @@
 import json
 import logging
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiohttp
@@ -28,11 +29,12 @@ BOT_TOKEN = "8450626723:AAHkbONr-iGmAQgtcAMIBxZXkkI0_QM82AM"
 LINKNI_STATUSES = ("subscribed", "not_subscribed", "no_sponsors")
 FLYER_UNSUBSCRIBE_STATUSES = frozenset({"unsubscribed", "abort", "failed", "unsubscribe"})
 
-app = FastAPI()
+# Flyer принимает только такой ответ: https://api.flyerhubs.com/redoc/webhook
+FLYER_OK_RESPONSE = {"status": True}
 
 
-@app.on_event("startup")
-async def on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
             CREATE TABLE IF NOT EXISTS flyer_webhook_events (
@@ -55,9 +57,13 @@ async def on_startup():
     logger.info("=" * 50)
     logger.info("Webhook-сервер стартовал")
     logger.info("База: %s", DB_PATH)
-    logger.info("Flyer:  POST /webhook/flyer")
+    logger.info("Flyer:  POST /flyer_webhook  (или /webhook/flyer)")
     logger.info("Linkni: POST /webhook/linkni/<secret>")
     logger.info("=" * 50)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 def parse_flyer_event(data: dict):
@@ -208,7 +214,8 @@ async def apply_flyer_penalty(user_id: int, signature: str) -> bool:
     return True
 
 
-async def process_flyer_webhook(data: dict) -> dict:
+async def process_flyer_webhook(data: dict) -> None:
+    """Обработка события Flyer. Ответ HTTP — всегда FLYER_OK_RESPONSE."""
     event_type, user_id, signature, status = parse_flyer_event(data)
     raw = json.dumps(data, ensure_ascii=False)
 
@@ -216,29 +223,31 @@ async def process_flyer_webhook(data: dict) -> dict:
 
     if event_type == "test":
         logger.info("[Flyer] test OK")
-        return {"ok": True, "type": "test"}
-
-    is_unsubscribe = False
-    if event_type == "new_status" and status in FLYER_UNSUBSCRIBE_STATUSES:
-        is_unsubscribe = True
-    if status in FLYER_UNSUBSCRIBE_STATUSES and event_type not in ("test",):
-        is_unsubscribe = True
-
-    if is_unsubscribe and user_id and signature:
-        applied = await apply_flyer_penalty(user_id, signature)
-        await save_flyer_event(event_type, user_id, signature, status, raw, processed=1 if applied else 0)
-        return {"ok": True, "penalty_applied": applied, "user_id": user_id, "signature": signature}
+        return
 
     if event_type == "sub_completed":
-        logger.info("[Flyer] sub_completed user=%s sig=%s", user_id, signature)
-        return {"ok": True, "type": "sub_completed"}
+        logger.info("[Flyer] sub_completed user=%s", user_id)
+        return
 
-    logger.info("[Flyer] событие сохранено без штрафа: type=%s status=%s", event_type, status)
-    return {"ok": True, "type": event_type, "status": status}
+    # new_status: отписка (документация — status: "abort")
+    if event_type == "new_status" and status in FLYER_UNSUBSCRIBE_STATUSES:
+        if user_id and signature:
+            applied = await apply_flyer_penalty(user_id, signature)
+            await save_flyer_event(
+                event_type, user_id, signature, status, raw, processed=1 if applied else 0
+            )
+            logger.info(
+                "[Flyer] new_status %s user=%s sig=%s penalty=%s",
+                status, user_id, signature, applied,
+            )
+        else:
+            logger.warning("[Flyer] new_status без user_id/signature: %s", data)
+        return
+
+    logger.info("[Flyer] событие без действия: type=%s status=%s", event_type, status)
 
 
-@app.post("/webhook/flyer")
-async def webhook_handler(request: Request):
+async def flyer_webhook_post(request: Request):
     try:
         data = await request.json()
     except Exception:
@@ -248,19 +257,27 @@ async def webhook_handler(request: Request):
     logger.info("[Flyer] POST: %s", data)
 
     try:
-        result = await process_flyer_webhook(data)
-        return result
+        await process_flyer_webhook(data)
     except Exception as e:
         logger.exception("[Flyer] ошибка обработки: %s", e)
-        return {"ok": False, "error": str(e)}
+
+    # Flyer проверяет именно {"status": true}, не ok/type/penalty_applied
+    return FLYER_OK_RESPONSE
 
 
+@app.post("/flyer_webhook")
+@app.post("/webhook/flyer")
+async def webhook_handler(request: Request):
+    return await flyer_webhook_post(request)
+
+
+@app.get("/flyer_webhook")
 @app.get("/webhook/flyer")
 async def flyer_webhook_get():
     return {
-        "ok": True,
+        "status": True,
         "message": "Flyer webhook активен. Нужен POST.",
-        "url_register_in_flyer_panel": "https://ВАШ_ДОМЕН/webhook/flyer",
+        "docs": "https://api.flyerhubs.com/redoc/webhook",
     }
 
 
