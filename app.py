@@ -2903,6 +2903,18 @@ async def flyer_get_tasks(user_id, language_code, limit=15):
         return []
 
 
+# Статусы успешного выполнения Flyer (flyerapi 1.3+: waiting, complete, …)
+FLYER_COMPLETED_STATUSES = frozenset({True, "completed", "done", "complete", "waiting"})
+
+
+def is_flyer_task_completed(status) -> bool:
+    if status is None:
+        return False
+    if status in FLYER_COMPLETED_STATUSES:
+        return True
+    return isinstance(status, str) and status.lower() in FLYER_COMPLETED_STATUSES
+
+
 # Flyer проверка задания
 async def flyer_check_task(signature, user_id=None):
     global flyer_enabled
@@ -2911,15 +2923,28 @@ async def flyer_check_task(signature, user_id=None):
         return None
 
     try:
-        # Используем метод check_task из библиотеки
-        status = await flyer.check_task(
-            user_id=user_id,
-            signature=signature
-        )
+        import inspect
+        params = inspect.signature(flyer.check_task).parameters
+        # flyerapi 1.3+: check_task(signature) — без user_id
+        # flyerapi <1.3: check_task(user_id, signature)
+        if "user_id" in params:
+            if user_id is None:
+                return None
+            status = await flyer.check_task(user_id, signature)
+        else:
+            status = await flyer.check_task(signature)
 
         print(f"🔍 Flyer check_task result: {status}")
         return status
 
+    except TypeError:
+        try:
+            status = await flyer.check_task(signature)
+            print(f"🔍 Flyer check_task result: {status}")
+            return status
+        except Exception as e:
+            print(f"❌ Flyer check_task error: {e}")
+            return None
     except Exception as e:
         print(f"❌ Flyer check_task error: {e}")
         return None
@@ -6750,8 +6775,7 @@ async def check_all_tasks(call: types.CallbackQuery):
                     status = await flyer_check_task(signature, user_id)
                     print(f"🔍 Flyer статус: {status}")
 
-                    # ЕСЛИ СТАТУС НЕ "INCOMPLETE" - ЗАДАНИЕ ВЫПОЛНЕНО
-                    if status != "incomplete":
+                    if is_flyer_task_completed(status):
                         print(f"✅ Задание выполнено! Статус: {status}")
 
                         # Проверяем не начисляли ли уже
