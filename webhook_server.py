@@ -121,6 +121,10 @@ async def linkni_webhook(secret: str, request: Request):
         raise HTTPException(status_code=400, detail="sub_code must be string")
 
     raw = json.dumps(data, ensure_ascii=False)
+    event_ts = (data.get("timestamp") or data.get("time") or data.get("created_at") or "")
+    if event_ts:
+        event_ts = str(event_ts).strip()[:32]
+    sub_code_norm = (sub_code or "").strip() if sub_code else ""
 
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -132,17 +136,50 @@ async def linkni_webhook(secret: str, request: Request):
                     status TEXT NOT NULL,
                     sell_code TEXT NOT NULL,
                     sub_code TEXT,
+                    event_ts TEXT,
                     received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     raw_json TEXT
                 )
                 """
             )
+            try:
+                await db.execute("ALTER TABLE linkni_subscriptions ADD COLUMN event_ts TEXT")
+            except Exception:
+                pass
+
+            if event_ts:
+                async with db.execute(
+                    """
+                    SELECT 1 FROM linkni_subscriptions
+                    WHERE user_id = ? AND sell_code = ?
+                      AND COALESCE(sub_code, '') = ? AND event_ts = ?
+                    """,
+                    (user_id, sell_code, sub_code_norm, event_ts),
+                ) as cur:
+                    if await cur.fetchone():
+                        logger.info("[Linkni] дубликат (event_ts), пропуск")
+                        return {"ok": True, "duplicate": True}
+            elif status == "subscribed":
+                async with db.execute(
+                    """
+                    SELECT 1 FROM linkni_subscriptions
+                    WHERE user_id = ? AND status = ? AND sell_code = ?
+                      AND COALESCE(sub_code, '') = ?
+                      AND received_at > datetime('now', '-5 minutes')
+                    """,
+                    (user_id, status, sell_code, sub_code_norm),
+                ) as cur:
+                    if await cur.fetchone():
+                        logger.info("[Linkni] дубликат (5 мин), пропуск")
+                        return {"ok": True, "duplicate": True}
+
             await db.execute(
                 """
-                INSERT INTO linkni_subscriptions (user_id, status, sell_code, sub_code, raw_json)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO linkni_subscriptions
+                (user_id, status, sell_code, sub_code, event_ts, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, status, sell_code, sub_code, raw),
+                (user_id, status, sell_code, sub_code_norm or None, event_ts or None, raw),
             )
             await db.commit()
         logger.info(

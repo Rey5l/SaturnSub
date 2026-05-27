@@ -919,10 +919,26 @@ async def init_db():
                 status TEXT NOT NULL,
                 sell_code TEXT NOT NULL,
                 sub_code TEXT,
+                event_ts TEXT,
                 received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 raw_json TEXT
             )
         ''')
+        try:
+            await db.execute("ALTER TABLE linkni_subscriptions ADD COLUMN event_ts TEXT")
+        except Exception:
+            pass
+        try:
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_linkni_event_unique "
+                "ON linkni_subscriptions(user_id, sell_code, COALESCE(sub_code, ''), COALESCE(event_ts, ''))"
+            )
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN linkni_session_started_at TIMESTAMP")
+        except Exception:
+            pass
         await db.execute('''
             CREATE TABLE IF NOT EXISTS linkni_paid_events (
                 subscription_id INTEGER PRIMARY KEY,
@@ -960,6 +976,15 @@ async def init_db():
         except Exception as e:
             if "duplicate column" not in str(e).lower():
                 print(f"⚠️ penalty_amount already exists or error: {e}")
+
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN linkni_session_started_at TIMESTAMP")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE linkni_subscriptions ADD COLUMN event_ts TEXT")
+        except Exception:
+            pass
 
         await db.commit()
 
@@ -2103,10 +2128,22 @@ async def linkni_ensure_tables(db):
             status TEXT NOT NULL,
             sell_code TEXT NOT NULL,
             sub_code TEXT,
+            event_ts TEXT,
             received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             raw_json TEXT
         )
     ''')
+    try:
+        await db.execute("ALTER TABLE linkni_subscriptions ADD COLUMN event_ts TEXT")
+    except Exception:
+        pass
+    try:
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_linkni_event_unique "
+            "ON linkni_subscriptions(user_id, sell_code, COALESCE(sub_code, ''), COALESCE(event_ts, ''))"
+        )
+    except Exception:
+        pass
     await db.execute('''
         CREATE TABLE IF NOT EXISTS linkni_paid_events (
             subscription_id INTEGER PRIMARY KEY,
@@ -2117,22 +2154,94 @@ async def linkni_ensure_tables(db):
     ''')
 
 
-async def linkni_save_subscription(user_id: int, status: str, sell_code: str, sub_code=None, raw_json=None):
-    """Сохранить событие (из API или дубль webhook)."""
+def linkni_normalize_event_ts(item: dict) -> str:
+    """Уникальный ключ события из API/webhook (поле timestamp)."""
+    ts = item.get("timestamp") or item.get("time") or item.get("created_at")
+    if ts:
+        return str(ts).strip()
+    return ""
+
+
+async def linkni_start_session(user_id: int):
+    """Новая сессия «Задания №2» — платим только за подписки после этого момента."""
     async with aiosqlite.connect("bot_database.db") as db:
-        await linkni_ensure_tables(db)
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN linkni_session_started_at TIMESTAMP")
+        except Exception:
+            pass
         await db.execute(
-            '''
-            INSERT INTO linkni_subscriptions (user_id, status, sell_code, sub_code, raw_json)
-            VALUES (?, ?, ?, ?, ?)
-            ''',
-            (user_id, status, sell_code, sub_code, raw_json),
+            "UPDATE users SET linkni_session_started_at = datetime('now') WHERE user_id = ?",
+            (user_id,),
         )
         await db.commit()
 
 
+async def linkni_get_session_started(user_id: int):
+    async with aiosqlite.connect("bot_database.db") as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT linkni_session_started_at FROM users WHERE user_id = ?",
+            (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return None
+    return row["linkni_session_started_at"] if "linkni_session_started_at" in row.keys() else None
+
+
+async def linkni_save_subscription(
+    user_id: int,
+    status: str,
+    sell_code: str,
+    sub_code=None,
+    raw_json=None,
+    event_ts: str = "",
+):
+    """Сохранить событие без дублей (уникальный event_ts или короткое окно для webhook)."""
+    sub_code = sub_code or ""
+    event_ts = (event_ts or "").strip()
+
+    async with aiosqlite.connect("bot_database.db") as db:
+        await linkni_ensure_tables(db)
+
+        if not event_ts and status == "subscribed":
+            # Webhook без timestamp: не дублируем то же событие за 3 минуты
+            async with db.execute(
+                '''
+                SELECT 1 FROM linkni_subscriptions
+                WHERE user_id = ? AND status = ? AND sell_code = ?
+                  AND COALESCE(sub_code, '') = ?
+                  AND received_at > datetime('now', '-3 minutes')
+                LIMIT 1
+                ''',
+                (user_id, status, sell_code, sub_code),
+            ) as cur:
+                if await cur.fetchone():
+                    return False
+
+        try:
+            await db.execute(
+                '''
+                INSERT INTO linkni_subscriptions
+                (user_id, status, sell_code, sub_code, event_ts, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''',
+                (user_id, status, sell_code, sub_code or None, event_ts or None, raw_json),
+            )
+            await db.commit()
+            return True
+        except Exception as e:
+            if "UNIQUE" in str(e).upper() or "unique" in str(e):
+                return False
+            raise
+
+
 async def linkni_sync_from_api(user_id: int, sell_code: str, sub_code: str):
-    """Подтянуть подписки за последний час из Linkni API (если webhook опоздал)."""
+    """Подтянуть подписки из API только за текущую сессию (не дублировать старый час)."""
+    session_at = await linkni_get_session_started(user_id)
+    if not session_at:
+        return
+
     params = {"code": sell_code, "user_id": user_id}
     if sub_code:
         params["sub_code"] = sub_code
@@ -2153,50 +2262,67 @@ async def linkni_sync_from_api(user_id: int, sell_code: str, sub_code: str):
     for item in data:
         if not isinstance(item, dict):
             continue
-        status = item.get("status")
-        if status != "subscribed":
+        if item.get("status") != "subscribed":
             continue
-        uid = item.get("user_id")
         try:
-            uid = int(uid)
+            uid = int(item.get("user_id"))
         except (TypeError, ValueError):
             continue
         if uid != user_id:
             continue
+
+        event_ts = linkni_normalize_event_ts(item)
+        # Не подтягиваем подписки, которые были ДО открытия «Задания №2»
+        if event_ts and str(event_ts) < str(session_at)[:19]:
+            continue
+
         item_sub = item.get("sub_code") or sub_code
         await linkni_save_subscription(
             uid,
-            status,
+            "subscribed",
             sell_code,
             item_sub,
             json.dumps(item, ensure_ascii=False),
+            event_ts=event_ts,
         )
 
 
-async def get_unpaid_linkni_subscriptions(user_id: int, sell_code: str, sub_code: str):
+async def get_unpaid_linkni_subscriptions(user_id: int, sell_code: str, sub_code: str, since_session: bool = True):
+    """
+    Неоплаченные подписки.
+    since_session=True — только с момента открытия «Задания №2» (не копим старые выплаты).
+    """
+    session_at = await linkni_get_session_started(user_id) if since_session else None
+
     async with aiosqlite.connect("bot_database.db") as db:
         await linkni_ensure_tables(db)
         db.row_factory = aiosqlite.Row
-        rows = await db.execute_fetchall(
-            '''
+
+        query = '''
             SELECT s.id, s.status, s.sell_code, s.sub_code, s.received_at
             FROM linkni_subscriptions s
             LEFT JOIN linkni_paid_events p ON p.subscription_id = s.id
             WHERE s.user_id = ?
               AND s.status = 'subscribed'
               AND s.sell_code = ?
-              AND (s.sub_code = ? OR s.sub_code IS NULL OR s.sub_code = '')
+              AND (s.sub_code = ? OR (? = '' AND (s.sub_code IS NULL OR s.sub_code = '')))
               AND p.subscription_id IS NULL
-            ORDER BY s.received_at ASC
-            ''',
-            (user_id, sell_code, sub_code),
-        )
-        return rows
+        '''
+        params = [user_id, sell_code, sub_code, sub_code]
+
+        if session_at:
+            query += " AND s.received_at >= ?"
+            params.append(session_at)
+
+        query += " ORDER BY s.received_at ASC"
+
+        return await db.execute_fetchall(query, tuple(params))
 
 
 async def pay_linkni_subscriptions(user_id: int, reward: float, sell_code: str, sub_code: str):
+    """Выплата только за новые подписки в текущей сессии Linkni."""
     await linkni_sync_from_api(user_id, sell_code, sub_code)
-    rows = await get_unpaid_linkni_subscriptions(user_id, sell_code, sub_code)
+    rows = await get_unpaid_linkni_subscriptions(user_id, sell_code, sub_code, since_session=True)
 
     paid = 0
     total = 0.0
@@ -2318,10 +2444,12 @@ async def show_user_tasks_v2(message: types.Message):
     Задания №2 — Linkni: подписки через mini-app, проверка webhook + API.
     """
     user_id = message.from_user.id
+    await linkni_start_session(user_id)
+
     sell_code, sub_code, reward = await get_linkni_config()
     app_link = build_linkni_app_link(sell_code, sub_code)
 
-    unpaid = await get_unpaid_linkni_subscriptions(user_id, sell_code, sub_code)
+    unpaid = await get_unpaid_linkni_subscriptions(user_id, sell_code, sub_code, since_session=True)
     pending_pay = len(unpaid)
 
     kb = InlineKeyboardBuilder()
@@ -2344,9 +2472,15 @@ async def show_user_tasks_v2(message: types.Message):
         f"<b>Награда:</b> {reward:.3f}$ за каждую подписку\n"
     )
     if pending_pay > 0:
-        text += f"\n🎁 <b>Готово к выплате:</b> {pending_pay} (нажмите «Проверить»)"
+        text += (
+            f"\n🎁 <b>Готово к выплате за эту сессию:</b> {pending_pay} "
+            f"(≈ {pending_pay * reward:.3f}$)"
+        )
     else:
-        text += "\n<i>После подписки Linkni пришлёт событие на сервер — обычно это несколько секунд.</i>"
+        text += (
+            "\n<i>Сначала откройте Linkni и выполните подписки, "
+            "затем нажмите «Проверить».</i>"
+        )
 
     await message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML", disable_web_page_preview=True)
 
@@ -2439,6 +2573,9 @@ async def check_user_tasks_v2(call: types.CallbackQuery):
     user_id = call.from_user.id
     sell_code, sub_code, reward = await get_linkni_config()
 
+    if not await linkni_get_session_started(user_id):
+        await linkni_start_session(user_id)
+
     await call.answer("🔍 Проверяем подписки Linkni...")
 
     paid_count, total_reward = await pay_linkni_subscriptions(user_id, reward, sell_code, sub_code)
@@ -2457,8 +2594,9 @@ async def check_user_tasks_v2(call: types.CallbackQuery):
             await call.message.answer(result_text, parse_mode='HTML')
     else:
         await call.answer(
-            "❌ Подписка не найдена.\n\n"
-            "Сначала откройте Linkni, выполните подписки и подождите 5–10 сек.",
+            "❌ Новых подписок за эту сессию нет.\n\n"
+            "Откройте «Задания №2» заново, выполните подписки в Linkni "
+            "и подождите 5–10 сек.",
             show_alert=True,
         )
 
